@@ -1,0 +1,114 @@
+#####	Run Seurat
+library(Seurat)
+
+seurat.obj <- NormalizeData(object = seurat.obj, normalization.method = "LogNormalize", scale.factor = 10000)
+seurat.obj <- FindVariableFeatures(object = seurat.obj, selection.method = "vst")
+seurat.obj <- CellCycleScoring(seurat.obj, s.features = cc.genes$s.genes, g2m.features = cc.genes$g2m.genes, set.ident = T)
+seurat.obj <- ScaleData(object = seurat.obj, features = rownames(seurat.obj), vars.to.regress = c("nCount_RNA", "percent.mt", "S.Score", "G2M.Score"))
+
+seurat.obj <- RunPCA(object = seurat.obj, features = VariableFeatures(object = seurat.obj), npcs = 17)
+seurat.obj <- JackStraw(object = seurat.obj, num.replicate = 100, dims = 17)
+seurat.obj <- ScoreJackStraw(object = seurat.obj, dims = 1:17)
+seurat.obj <- FindNeighbors(object = seurat.obj, dims = 1:17, force.recalc = T)
+seurat.obj <- FindClusters(object = seurat.obj, resolution = 0.6)
+seurat.obj <- RunUMAP(object = seurat.obj, dims = 1:17)
+seurat.obj <- RunTSNE(object = seurat.obj, dims = 1:17)
+
+seurat.degs <- FindAllMarkers(object = seurat.obj, min.pct = 0.25, logfc.threshold = 0.25)
+
+
+#####	Modular score calculation
+ductal.obj <- AddModuleScore(object = ductal.obj, features = signature.list, name = paste0(names(signature.list), "."))
+
+
+#####	Survival analysis
+library(survival)
+library(survminer)
+
+basal.prop.df <- read.table(FACTION_OF_DUCTAL_CELL_SUBTYPE_FILE)
+
+basal.prop.df$State[basal.prop.df$Ratio <= 0.22] <- "Low"
+basal.prop.df$State[basal.prop.df$Ratio > 0.22] <- "High"
+
+basal.surv <- Surv(time = basal.prop.df$OS, event = basal.prop.df$Death)
+basal.fit <- survfit(basal.surv ~ State, data = basal.prop.df)
+
+ggsurvplot(basal.fit, data = basal.prop.df, pval = T, size = 1.5, palette = c("#ec1c24", "#00a8f3"))
+
+
+#####   Cox regression
+cox.surv <- Surv(time = ductal.prop.df$OS, event = ductal.prop.df$Death)
+cox.res <- coxph(cox.surv ~ formula, data = ductal.prop.df)
+
+ggforest(cox.res, data = ductal.prop.df)
+
+
+#####	Run CopyKat
+library(Seurat)
+library(copykat)
+
+count.mat <- as.matrix(subset.obj@assays$RNA@counts)
+copykat.res <- copykat(rawmat = count.mat, id.type = "S", norm.cell.names = myeloid.barcodes, distance = "euclidean", ngene.chr = 5, LOW.DR = 0.05, UP.DR = 0.2, win.size = 25, KS.cut = 0.15)
+
+
+#####	Run Monocle2
+library(Seurat)
+library(monocle)
+
+count.mat <- as.matrix(ductal.subset.obj@assays$RNA@counts)
+
+pd <- new('AnnotatedDataFrame', data = ductal.subset.obj@meta.data)
+genes.df <- data.frame(apply(X = count.mat, 1, FUN = function(x) { sum(x > 0)} ))
+fd <- new('AnnotatedDataFrame', data = data.frame(gene_short_name = row.names(gene.df), row.names = row.names(gene.df), num_cells_expressed = gene.df[,1]))
+
+cds <- newCellDataSet(count.mat, phenoData = pd, featureData = fd, expressionFamily = negbinomial.size())
+cds <- estimateSizeFactors(cds)
+cds <- estimateDispersions(cds)
+
+set.seed(123)
+cds <- detectGenes(cds, min_expr = 0.1)
+cds <- cds[row.names(subset(fData(cds), num_cells_expressed >= 50)),]
+cds <- reduceDimension(cds = cds, max_components = 3, method = 'DDRTree')
+cds <- orderCells(cds)
+
+
+#####	Run CellPhoneDB
+library(Seurat)
+library(spacexr)
+
+visium.counts <- Read10X(visium.dir)
+visium.obj <- CreateSeuratObject(counts = visium.counts, assay = "Spatial")
+visium.image <- Read10X_Image(image.dir = visium.dir)
+visium.image <- visium.image[Cells(x = visium.obj)]
+DefaultAssay(object = visium.image) <- "Spatial"
+visium.obj[["slice1"]] <- visium.image
+
+visium.counts <- visium.obj@assays$Spatial@counts
+visium.coords <- GetTissueCoordinates(visium.obj)
+colnames(visium.coords) <- c("x", "y")
+visium.coords[is.na(colnames(visium.coords))] <- NULL
+visium.query <- SpatialRNA(visium.coords, visium.counts, colSums(visium.counts))
+
+rctd.obj <- create.RCTD(visium.query, reference.obj)
+rctd.obj <- run.RCTD(rctd.obj, doublet_mode = "full")
+
+rctd.prop <- data.frame(normalize_weights(rctd.obj@results$weights))
+
+
+#####	Run SCENIC
+library(SCENIC)
+library(Seurat)
+library(AUCell)
+
+scenicOptions <- initializeScenic(org = "hgnc", dbDir = cistarget.dir)
+
+count.mat <- x.expr <- as.matrix(classical.obj@assays$RNA@counts)
+count.mat <- count.mat[geneFiltering(count.mat, scenicOptions = scenicOptions), ]
+
+runCorrelation(count.mat, scenicOptions)
+count.mat <- log2(count.mat + 1)
+runGenie3(count.mat, scenicOptions)
+
+runSCENIC_1_coexNetwork2modules(scenicOptions)
+runSCENIC_2_createRegulons(scenicOptions)
+runSCENIC_3_scoreCells(scenicOptions, count.mat)
